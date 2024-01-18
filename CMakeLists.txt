@@ -1,3 +1,8 @@
 cmake_minimum_required(VERSION 3.16.0)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+list(APPEND EXTRA_COMPONENT_DIRS idf-extra-components/usb/usb_host_vcp)
+list(APPEND EXTRA_COMPONENT_DIRS idf-extra-components/usb/usb_host_ftdi_vcp)
+list(APPEND EXTRA_COMPONENT_DIRS idf-extra-components/usb/usb_host_cp210x_vcp)
+list(APPEND EXTRA_COMPONENT_DIRS idf-extra-components/usb/usb_host_ch34x_vcp)
+list(APPEND EXTRA_COMPONENT_DIRS idf-extra-components/usb/usb_host_cdc_acm)
 project(usb-cdc-acm)
