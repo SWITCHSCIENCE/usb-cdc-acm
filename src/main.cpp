@@ -6,20 +6,28 @@
  * need CONFIG_COMPILER_CXX_EXCEPTIONS=y
  */
 
-#include <stdio.h>
+#include <lwip/netdb.h>
 #include <string.h>
+#include <sys/param.h>
+
+#define LGFX_M5ATOMS3
+
+#include <LGFX_AUTODETECT.hpp>
+#include <LovyanGFX.hpp>
 
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
-#include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "lwip/err.h"
+#include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include "nvs_flash.h"
+#include "protocol_examples_common.h"
 #include "usb/cdc_acm_host.h"
 #include "usb/usb_host.h"
 #include "usb/vcp.hpp"
@@ -27,144 +35,203 @@
 #include "usb/vcp_cp210x.hpp"
 #include "usb/vcp_ftdi.hpp"
 
-using namespace esp_usb;
-
-// Change these values to match your needs
-#define EXAMPLE_ESP_WIFI_SSID CONFIG_ESP_WIFI_SSID
-#define EXAMPLE_ESP_WIFI_PASS CONFIG_ESP_WIFI_PASSWORD
-#define EXAMPLE_ESP_MAXIMUM_RETRY 3
 #define EXAMPLE_BAUDRATE (57600)
 #define EXAMPLE_STOP_BITS (0)  // 0: 1 stopbit, 1: 1.5 stopbits, 2: 2 stopbits
 #define EXAMPLE_PARITY (0)     // 0: None, 1: Odd, 2: Even, 3: Mark, 4: Space
 #define EXAMPLE_DATA_BITS (8)
+#define INVALID_SOCK (-1)
+#define YIELD_TO_ALL_MS 50
 
-#if CONFIG_ESP_WPA3_SAE_PWE_HUNT_AND_PECK
-#define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HUNT_AND_PECK
-#define EXAMPLE_H2E_IDENTIFIER ""
-#elif CONFIG_ESP_WPA3_SAE_PWE_HASH_TO_ELEMENT
-#define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HASH_TO_ELEMENT
-#define EXAMPLE_H2E_IDENTIFIER CONFIG_ESP_WIFI_PW_ID
-#elif CONFIG_ESP_WPA3_SAE_PWE_BOTH
-#define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_BOTH
-#define EXAMPLE_H2E_IDENTIFIER CONFIG_ESP_WIFI_PW_ID
-#endif
-#if CONFIG_ESP_WIFI_AUTH_OPEN
-#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_OPEN
-#elif CONFIG_ESP_WIFI_AUTH_WEP
-#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WEP
-#elif CONFIG_ESP_WIFI_AUTH_WPA_PSK
-#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA_PSK
-#elif CONFIG_ESP_WIFI_AUTH_WPA2_PSK
-#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA2_PSK
-#elif CONFIG_ESP_WIFI_AUTH_WPA_WPA2_PSK
-#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA_WPA2_PSK
-#elif CONFIG_ESP_WIFI_AUTH_WPA3_PSK
-#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA3_PSK
-#elif CONFIG_ESP_WIFI_AUTH_WPA2_WPA3_PSK
-#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA2_WPA3_PSK
-#elif CONFIG_ESP_WIFI_AUTH_WAPI_PSK
-#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WAPI_PSK
-#endif
+using namespace esp_usb;
 
-/* The event group allows multiple bits for each event, but we only care about
- * two events:
- * - we are connected to the AP with an IP
- * - we failed to connect after the maximum amount of retries */
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT BIT1
-
-namespace {
-
-/* FreeRTOS event group to signal when we are connected*/
-static EventGroupHandle_t s_wifi_event_group;
-
-static const char *TAG = "VCP example";
+static const char *TAG = "cdc-forward";
 static SemaphoreHandle_t device_disconnected_sem;
+static std::string response =
+    "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\n\r\n";
+static LGFX lcd;
 
-static int s_retry_num = 0;
+QueueHandle_t queue;
 
-static void event_handler(void *arg, esp_event_base_t event_base,
-                          int32_t event_id, void *event_data) {
-  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-    esp_wifi_connect();
-  } else if (event_base == WIFI_EVENT &&
-             event_id == WIFI_EVENT_STA_DISCONNECTED) {
-    if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
-      esp_wifi_connect();
-      s_retry_num++;
-      ESP_LOGI(TAG, "retry to connect to the AP");
-    } else {
-      xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-    }
-    ESP_LOGI(TAG, "connect to the AP fail");
-  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-    ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-    s_retry_num = 0;
-    xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-  }
+/**
+ * @brief Utility to log socket errors
+ *
+ * @param[in] tag Logging tag
+ * @param[in] sock Socket number
+ * @param[in] err Socket errno
+ * @param[in] message Message to print
+ */
+static void log_socket_error(const char *tag, const int sock, const int err,
+                             const char *message) {
+  ESP_LOGE(tag,
+           "[sock=%d]: %s\n"
+           "errorHandle=%d: %s",
+           sock, message, err, strerror(err));
 }
 
-void wifi_init_sta(void) {
-  s_wifi_event_group = xEventGroupCreate();
-
-  ESP_ERROR_CHECK(esp_netif_init());
-
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
-  esp_netif_create_default_wifi_sta();
-
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-  esp_event_handler_instance_t instance_any_id;
-  esp_event_handler_instance_t instance_got_ip;
-  ESP_ERROR_CHECK(esp_event_handler_instance_register(
-      WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
-  ESP_ERROR_CHECK(esp_event_handler_instance_register(
-      IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
-
-  wifi_config_t wifi_config = {
-      .sta =
-          {
-              .ssid = EXAMPLE_ESP_WIFI_SSID,
-              .password = EXAMPLE_ESP_WIFI_PASS,
-              /* Authmode threshold resets to WPA2 as default if password
-               * matches WPA2 standards (pasword len => 8). If you want to
-               * connect the device to deprecated WEP/WPA networks, Please set
-               * the threshold value to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set
-               * the password with length and format matching to
-               * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-               */
-              //.threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
-              .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
-              .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
-          },
-  };
-  wifi_config.sta.threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD;
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-  ESP_ERROR_CHECK(esp_wifi_start());
-
-  ESP_LOGI(TAG, "wifi_init_sta finished.");
-
-  /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or
-   * connection failed for the maximum number of re-tries (WIFI_FAIL_BIT). The
-   * bits are set by event_handler() (see above) */
-  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                         pdFALSE, pdFALSE, portMAX_DELAY);
-
-  /* xEventGroupWaitBits() returns the bits before the call returned, hence we
-   * can test which event actually happened. */
-  if (bits & WIFI_CONNECTED_BIT) {
-    ESP_LOGI(TAG, "connected to ap SSID:%s password:%s", EXAMPLE_ESP_WIFI_SSID,
-             EXAMPLE_ESP_WIFI_PASS);
-  } else if (bits & WIFI_FAIL_BIT) {
-    ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
-  } else {
-    ESP_LOGE(TAG, "UNEXPECTED EVENT");
+/**
+ * @brief Sends the specified data to the socket. This function blocks until all
+ * bytes got sent.
+ *
+ * @param[in] tag Logging tag
+ * @param[in] sock Socket to write data
+ * @param[in] data Data to be written
+ * @param[in] len Length of the data
+ * @return
+ *          >0 : Size the written data
+ *          -1 : Error occurred during socket write operation
+ */
+static int socket_send(const char *tag, const int sock, const char *data,
+                       const size_t len) {
+  int to_write = len;
+  while (to_write > 0) {
+    int written = send(sock, data + (len - to_write), to_write, 0);
+    if (written < 0 && errno != EINPROGRESS && errno != EAGAIN &&
+        errno != EWOULDBLOCK) {
+      log_socket_error(tag, sock, errno, "Error occurred during sending");
+      return -1;
+    }
+    to_write -= written;
   }
+  return len;
+}
+
+/**
+ * @brief Returns the string representation of client's address (accepted on
+ * this server)
+ */
+static inline char *get_clients_address(struct sockaddr_storage *source_addr) {
+  static char address_str[128];
+  char *res = NULL;
+  // Convert ip address to string
+  if (source_addr->ss_family == PF_INET) {
+    res = inet_ntoa_r(((struct sockaddr_in *)source_addr)->sin_addr,
+                      address_str, sizeof(address_str) - 1);
+  }
+#ifdef CONFIG_LWIP_IPV6
+  else if (source_addr->ss_family == PF_INET6) {
+    res = inet6_ntoa_r(((struct sockaddr_in6 *)source_addr)->sin6_addr,
+                       address_str, sizeof(address_str) - 1);
+  }
+#endif
+  if (!res) {
+    address_str[0] = '\0';  // Returns empty string if conversion didn't succeed
+  }
+  return address_str;
+}
+
+static void wifi_got_ip(void *arg, esp_event_base_t base, int32_t event_id,
+                        void *data) {
+  const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)data;
+  lcd.setCursor(10, 20);
+  lcd.printf("My IP: " IPSTR "\n", IP2STR(&event->ip_info.ip));
+  lcd.printf("My GW: " IPSTR "\n", IP2STR(&event->ip_info.gw));
+  lcd.printf("My NETMASK: " IPSTR "\n", IP2STR(&event->ip_info.netmask));
+}
+
+static void tcp_server_task(void *pvParameters) {
+  static const char *TAG = "socket-server";
+
+  vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+  ESP_ERROR_CHECK(nvs_flash_init());
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                             wifi_got_ip, NULL));
+
+  /* This helper function configures Wi-Fi or Ethernet, as selected in
+   * menuconfig. Read "Establishing Wi-Fi or Ethernet Connection" section in
+   * examples/protocols/README.md for more information about this function.
+   */
+  ESP_ERROR_CHECK(example_connect());
+
+  // SemaphoreHandle_t *server_ready = (SemaphoreHandle_t *)(pvParameters);
+  struct addrinfo hints = {.ai_socktype = SOCK_STREAM};
+  struct addrinfo *address_info;
+  int listen_sock = INVALID_SOCK;
+  int err;
+
+  // Translating the hostname or a string representation of an IP to
+  // address_info
+  int res =
+      getaddrinfo(CONFIG_EXAMPLE_TCP_SERVER_BIND_ADDRESS,
+                  CONFIG_EXAMPLE_TCP_SERVER_BIND_PORT, &hints, &address_info);
+  if (res != 0 || address_info == NULL) {
+    ESP_LOGE(TAG,
+             "couldn't get hostname for `%s` "
+             "getaddrinfo() returns %d, addrinfo=%p",
+             CONFIG_EXAMPLE_TCP_SERVER_BIND_ADDRESS, res, address_info);
+    goto errorHandle;
+  }
+
+  // Creating a listener socket
+  listen_sock = socket(address_info->ai_family, address_info->ai_socktype,
+                       address_info->ai_protocol);
+
+  if (listen_sock < 0) {
+    log_socket_error(TAG, listen_sock, errno, "Unable to create socket");
+    goto errorHandle;
+  }
+  ESP_LOGI(TAG, "Listener socket created");
+
+  // Binding socket to the given address
+  err = bind(listen_sock, address_info->ai_addr, address_info->ai_addrlen);
+  if (err != 0) {
+    log_socket_error(TAG, listen_sock, errno, "Socket unable to bind");
+    goto errorHandle;
+  }
+  ESP_LOGI(TAG, "Socket bound on %s:%s", CONFIG_EXAMPLE_TCP_SERVER_BIND_ADDRESS,
+           CONFIG_EXAMPLE_TCP_SERVER_BIND_PORT);
+
+  // Set queue (backlog) of pending connections to one (can be more)
+  err = listen(listen_sock, 1);
+  if (err != 0) {
+    log_socket_error(TAG, listen_sock, errno, "Error occurred during listen");
+    goto errorHandle;
+  }
+  ESP_LOGI(TAG, "Socket listening");
+  // xSemaphoreGive(*server_ready);
+
+  // Main loop for accepting new connections and serving all connected clients
+  while (1) {
+    struct sockaddr_storage source_addr;  // Large enough for both IPv4 or IPv6
+    socklen_t addr_len = sizeof(source_addr);
+
+    int sock = accept(listen_sock, (struct sockaddr *)&source_addr, &addr_len);
+    if (sock < 0) {
+      ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
+      break;
+    }
+
+    // We have a new client connected -> print it's address
+    ESP_LOGI(TAG, "Connection accepted from IP:%s",
+             get_clients_address(&source_addr));
+    socket_send(TAG, sock, response.c_str(), response.length());
+
+    while (1) {
+      uint8_t data;
+      BaseType_t result =
+          xQueueReceive(queue, &data, pdMS_TO_TICKS(YIELD_TO_ALL_MS));
+      if (result != pdPASS) continue;
+      // We serve all the connected clients in this loop
+      int len = socket_send(TAG, sock, (const char *)(&data), sizeof(uint8_t));
+      if (len < 0) {
+        // Error occurred on write to this socket -> close it and mark
+        // invalid
+        ESP_LOGI(TAG, "socket_send() returned %d -> closing the socket", len);
+        close(sock);
+        break;
+      }
+    }
+  }
+
+errorHandle:
+  if (listen_sock != INVALID_SOCK) {
+    close(listen_sock);
+  }
+
+  free(address_info);
+  vTaskDelete(NULL);
 }
 
 /**
@@ -183,6 +250,7 @@ static bool handle_rx(const uint8_t *data, size_t data_len, void *arg) {
   // printf("%.*s", data_len, data);
   for (size_t i = 0; i < data_len; i++) {
     if (data[i] != '`') {
+      xQueueSend(queue, &(data[i]), (TickType_t)0);
       printf("%c", data[i]);
     }
   }
@@ -201,7 +269,7 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event,
                          void *user_ctx) {
   switch (event->type) {
     case CDC_ACM_HOST_ERROR:
-      ESP_LOGE(TAG, "CDC-ACM error has occurred, err_no = %d",
+      ESP_LOGE(TAG, "CDC-ACM errorHandle has occurred, err_no = %d",
                event->data.error);
       break;
     case CDC_ACM_HOST_DEVICE_DISCONNECTED:
@@ -236,7 +304,6 @@ static void usb_lib_task(void *arg) {
     }
   }
 }
-}  // namespace
 
 /**
  * @brief Main application
@@ -244,6 +311,12 @@ static void usb_lib_task(void *arg) {
  * This function shows how you can use Virtual COM Port drivers
  */
 extern "C" void app_main(void) {
+  lcd.init();
+  queue = xQueueCreate(4096, sizeof(uint8_t));
+  if (queue == NULL) {
+    ESP_LOGE(TAG, "queue init failed.");
+  }
+
   device_disconnected_sem = xSemaphoreCreateBinary();
   assert(device_disconnected_sem);
 
@@ -267,6 +340,13 @@ extern "C" void app_main(void) {
   VCP::register_driver<FT23x>();
   VCP::register_driver<CP210x>();
   VCP::register_driver<CH34x>();
+
+  // SemaphoreHandle_t server_ready = xSemaphoreCreateBinary();
+  // assert(server_ready);
+  // xTaskCreate(tcp_server_task, "tcp_server", 4096, &server_ready, 5, NULL);
+  // xSemaphoreTake(server_ready, portMAX_DELAY);
+  // vSemaphoreDelete(server_ready);
+  xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
 
   // Do everything else in a loop, so we can demonstrate USB device
   // reconnections

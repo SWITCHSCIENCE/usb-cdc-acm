@@ -10,6 +10,12 @@ dependencies:
     source:
       type: idf
     version: 5.1.2
-manifest_hash: 72bea7787a64d4ccc8efa3c5f20ff7cdac39725ccc7804ddcaa93cb6e02dc9d8
+  protocol_examples_common:
+    component_hash: null
+    source:
+      path: C:\Users\nobo\.platformio\packages\framework-espidf\examples\common_components\protocol_examples_common
+      type: local
+    version: '*'
+manifest_hash: 7a10b42dded23f96920ec00a7371ceb840f502f21a5005db02e0ad7d84489c2b
 target: esp32s3
 version: 1.0.0
